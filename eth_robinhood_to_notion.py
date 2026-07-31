@@ -98,6 +98,24 @@ def parse_wallets(raw):
     return out
 
 
+def report_wallet_parse(raw, accepted):
+    """Surface silently-dropped wallets — the usual cause of a total being
+    'off by a few ETH' after the wallet list is edited."""
+    chunks = [c for c in re.split(r"[\s,;]+", (raw or "").strip()) if c]
+    addr_like = [c for c in chunks if "0x" in c.lower()]
+    rejected = [c for c in addr_like if not re.fullmatch(r"0x[0-9a-fA-F]{40}", c)]
+    total_matches = len(ADDR_RE.findall(raw or ""))
+    dupes = total_matches - len(accepted)
+    log(f"  Wallet parse: {len(chunks)} entries in secret -> {len(accepted)} valid 0x addresses accepted")
+    if dupes > 0:
+        log(f"  note: {dupes} duplicate address(es) collapsed")
+    if rejected:
+        log(f"  WARNING: {len(rejected)} entr(y/ies) look like an address but were REJECTED as malformed:")
+        for c in rejected[:20]:
+            log(f"    rejected: {mask(c)}  (length {len(c)}, expected 42)")
+        log("  -> fix these in the ETH_WALLETS_CSV secret; their ETH is NOT being counted.")
+
+
 def backoff(attempt):
     d = min(2 ** attempt + random.uniform(0, 0.8), RPC_BACKOFF_CAP)
     log(f"  [backoff] {d:.1f}s")
@@ -235,30 +253,44 @@ def notion_headers():
     }
 
 
+NOTION_TIMEOUT = int(os.environ.get("NOTION_TIMEOUT", "30"))
+NOTION_RETRIES = int(os.environ.get("NOTION_RETRIES", "5"))
+_NOTION_RETRY_HTTP = {429, 500, 502, 503, 504}
+
+
+def _notion_http(url, data, method):
+    """Send a Notion request with retries on timeouts / transient errors."""
+    last_err = None
+    for attempt in range(NOTION_RETRIES):
+        try:
+            req = urllib.request.Request(url, data=data, headers=notion_headers(), method=method)
+            with urllib.request.urlopen(req, timeout=NOTION_TIMEOUT) as r:
+                res = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
+                if isinstance(res, dict) and res.get("object") == "error":
+                    raise Exception(f"Notion error: {res}")
+                return res
+        except urllib.error.HTTPError as e:
+            try:    detail = e.read().decode()
+            except: detail = ""
+            if e.code in _NOTION_RETRY_HTTP:
+                last_err = f"HTTP {e.code}"
+                log(f"  [notion] {last_err}, retrying")
+                backoff(attempt)
+            else:
+                raise Exception(f"Notion HTTP {e.code}: {detail}")
+        except Exception as ex:  # URLError, socket timeout, TimeoutError, etc.
+            last_err = str(ex)
+            log(f"  [notion] {last_err}, retrying")
+            backoff(attempt)
+    raise Exception(f"Notion request failed after {NOTION_RETRIES} tries: {last_err}")
+
+
 def notion_req(url, body, method="POST"):
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers=notion_headers(),
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
-            if isinstance(data, dict) and data.get("object") == "error":
-                raise Exception(f"Notion error: {data}")
-            return data
-    except urllib.error.HTTPError as e:
-        raise Exception(f"Notion HTTP {e.code}: {e.read().decode()}")
+    return _notion_http(url, json.dumps(body).encode(), method)
 
 
 def notion_get(url):
-    req = urllib.request.Request(url, headers=notion_headers(), method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode("utf-8", errors="replace") or "{}")
-    except urllib.error.HTTPError as e:
-        raise Exception(f"Notion HTTP {e.code}: {e.read().decode()}")
+    return _notion_http(url, None, "GET")
 
 
 def ensure_number_props(db_id, names, number_format="australian_dollar"):
@@ -286,20 +318,33 @@ def notion_query_paginated(db_id, body):
     return rows
 
 
-def get_prev_perwallet_rows(today):
-    rows = notion_query_paginated(NOTION_DB_PERWALLET, {
-        "filter": {"property": "Date", "date": {"before": today}},
-        "sorts":  [{"property": "Date", "direction": "descending"}],
-        "page_size": 100,
-    })
-    lookup = {}
-    for page in rows:
-        try:
-            w = page["properties"][TITLE_PROP]["title"][0]["plain_text"]
-            if w not in lookup:
-                lookup[w] = page
-        except (KeyError, IndexError):
-            continue
+def get_prev_perwallet_rows(today, wallets=None):
+    """Latest row before `today` for each wallet. Stops paginating as soon as
+    every wallet in `wallets` has been found — so it reads ~1-2 pages in the
+    normal case instead of the entire (now huge) history."""
+    want = set(wallets) if wallets else None
+    lookup, cursor = {}, None
+    while True:
+        body = {
+            "filter": {"property": "Date", "date": {"before": today}},
+            "sorts":  [{"property": "Date", "direction": "descending"}],
+            "page_size": 100,
+        }
+        if cursor:
+            body["start_cursor"] = cursor
+        res = notion_req(f"https://api.notion.com/v1/databases/{NOTION_DB_PERWALLET}/query", body)
+        for page in res.get("results", []):
+            try:
+                w = page["properties"][TITLE_PROP]["title"][0]["plain_text"]
+                if w not in lookup:
+                    lookup[w] = page
+            except (KeyError, IndexError):
+                continue
+        if want and want.issubset(lookup.keys()):
+            break
+        if not res.get("has_more"):
+            break
+        cursor = res.get("next_cursor")
     return lookup
 
 
@@ -343,6 +388,7 @@ def main():
     log(f"Stablecoin: {STABLE_SYMBOL} {mask(STABLE_CONTRACT)} (decimals={STABLE_DECIMALS})")
 
     wallets = parse_wallets(WALLETS_CSV)
+    report_wallet_parse(WALLETS_CSV, wallets)
     if not wallets:
         fail("No valid 0x EVM addresses found in ETH_WALLETS_CSV")
 
@@ -372,7 +418,7 @@ def main():
     ensure_number_props(NOTION_DB_DAILYTOTAL, [PRICE_PROP, AUD_DELTA_PROP])
 
     log(f"\n--- Fetching previous Notion rows ---")
-    prev_lookup = get_prev_perwallet_rows(today)
+    prev_lookup = get_prev_perwallet_rows(today, wallets)
     prev_total  = get_prev_total_row(today)
     log(f"  {len(prev_lookup)} previous per-wallet rows found")
 

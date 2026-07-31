@@ -1,8 +1,11 @@
 name: Robinhood Chain Notion Tracker
 
 on:
-  schedule:
-    - cron: "30 17 * * *"   # 5:30 PM UTC daily (offset from the SOL tracker at 17:00)
+  # PAUSED: daily schedule disabled — the tracker no longer runs automatically.
+  # It stays fully usable via "Run workflow" below. To resume daily runs,
+  # uncomment the schedule block.
+  # schedule:
+  #   - cron: "30 17 * * *"   # 5:30 PM UTC daily (offset from the SOL tracker at 17:00)
   workflow_dispatch:
     inputs:
       mode:
