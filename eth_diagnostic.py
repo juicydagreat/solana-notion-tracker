@@ -41,6 +41,19 @@ def parse_wallets(raw):
     return out
 
 
+def report_wallet_parse(raw, accepted):
+    chunks = [c for c in re.split(r"[\s,;]+", (raw or "").strip()) if c]
+    addr_like = [c for c in chunks if "0x" in c.lower()]
+    rejected = [c for c in addr_like if not re.fullmatch(r"0x[0-9a-fA-F]{40}", c)]
+    dupes = len(ADDR_RE.findall(raw or "")) - len(accepted)
+    log(f"Entries in secret: {len(chunks)}  ->  accepted: {len(accepted)}"
+        + (f"  (dupes collapsed: {dupes})" if dupes > 0 else ""))
+    if rejected:
+        log(f"WARNING: {len(rejected)} malformed address(es) REJECTED (ETH not counted):")
+        for c in rejected[:20]:
+            log(f"  rejected: {mask(c)}  (length {len(c)}, expected 42)")
+
+
 def backoff(attempt):
     d = min(2 ** attempt + random.uniform(0, 0.8), RPC_BACKOFF_CAP)
     log(f"  Retrying in {d:.1f}s...")
@@ -97,6 +110,7 @@ def get_stable(wallet):
 
 def main():
     wallets = parse_wallets(WALLETS_CSV)
+    report_wallet_parse(WALLETS_CSV, wallets)
     if not wallets:
         fail("No valid 0x EVM addresses found in ETH_WALLETS_CSV")
 
